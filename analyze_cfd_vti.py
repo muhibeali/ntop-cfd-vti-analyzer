@@ -68,7 +68,7 @@ if hasattr(sys.stdout, "reconfigure"):
 #  USER CONFIGURATION — edit these values before running
 # ──────────────────────────────────────────────────────────────────────────────
 
-VTI_FILE  = "CFD ATAS 0.006 at 2.5 deg Implicit.vti"  # path to the .vti file
+VTI_FILE  = "CFD ATAS 0.1 at 2.5 deg Implicit.vti"  # path to the .vti file
 ALPHA_DEG = 2.5                                         # angle of attack [deg]
                                                         # positive = freestream
                                                         # tilts from +X toward +Z
