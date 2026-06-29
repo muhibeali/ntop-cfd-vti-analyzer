@@ -68,10 +68,17 @@ if hasattr(sys.stdout, "reconfigure"):
 #  USER CONFIGURATION — edit these values before running
 # ──────────────────────────────────────────────────────────────────────────────
 
-VTI_FILE = "CFD ATAS 0.006 at 2.5 deg Implicit.vti"  # path to the .vti file
-ALPHA_DEG = 2.5                                        # angle of attack [deg]
-                                                       # positive = freestream
-                                                       # tilts from +X toward +Z
+VTI_FILE  = "CFD ATAS 0.006 at 2.5 deg Implicit.vti"  # path to the .vti file
+ALPHA_DEG = 2.5                                         # angle of attack [deg]
+                                                        # positive = freestream
+                                                        # tilts from +X toward +Z
+
+# Reference parameters for nondimensionalisation
+V_INF  = 30.48           # freestream speed [m/s]
+RHO    = 1.2250123       # air density [kg/m³]
+S_REF  = 0.4607990784    # reference wing area [m²]
+T_INF  = 288.15          # freestream temperature [K]
+MACH   = 0.0897          # freestream Mach number
 
 # Body-axis reference directions (matches nTop default coordinate system)
 DRAG_DIRECTION = np.array([1.0, 0.0, 0.0])   # body +X — streamwise reference
@@ -425,7 +432,10 @@ def compute_forces(mesh:      pv.ImageData,
                    fields:    dict,
                    alpha_deg: float,
                    drag_dir:  np.ndarray = DRAG_DIRECTION,
-                   lift_dir:  np.ndarray = LIFT_DIRECTION) -> dict:
+                   lift_dir:  np.ndarray = LIFT_DIRECTION,
+                   v_inf_ref: float = V_INF,
+                   rho:       float = RHO,
+                   s_ref:     float = S_REF) -> dict:
     """
     Sum 'Force time-averaged' over the IB interface layer to get aerodynamic forces.
 
@@ -451,7 +461,8 @@ def compute_forces(mesh:      pv.ImageData,
     dict
         total_force_N, drag_N, lift_N, span_N, n_ib_pts,
         force_field_name, v_inf_ms, n_upstream_pts,
-        alpha_deg, drag_axis, lift_axis
+        alpha_deg, drag_axis, lift_axis,
+        q_inf_pa, CD, CL, LD
     """
     print(f"\n{'─'*64}")
     print("  FORCE COMPUTATION")
@@ -570,11 +581,19 @@ def compute_forces(mesh:      pv.ImageData,
     print(f"  Per-pt drag range   : [{drag_pc.min():.4g}, {drag_pc.max():.4g}] N")
     print(f"  Per-pt lift range   : [{lift_pc.min():.4g}, {lift_pc.max():.4g}] N")
 
+    # ── Nondimensionalisation ─────────────────────────────────────────────
+    q_inf = 0.5 * rho * v_inf_ref**2       # dynamic pressure [Pa]
+    qS    = q_inf * s_ref                  # [N]
+    CD    = drag / qS
+    CL    = lift / qS
+    LD    = lift / drag if abs(drag) > 1e-12 else float("nan")
+
     return dict(total_force_N=total_force,
                 drag_N=drag, lift_N=lift, span_N=span,
                 n_ib_pts=n_ib, force_field_name=f_name,
                 v_inf_ms=v_inf, n_upstream_pts=n_upstream,
-                alpha_deg=alpha_deg, drag_axis=drag_dir, lift_axis=lift_dir)
+                alpha_deg=alpha_deg, drag_axis=drag_dir, lift_axis=lift_dir,
+                q_inf_pa=q_inf, CD=CD, CL=CL, LD=LD)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -598,19 +617,26 @@ def print_summary(results: dict) -> None:
     ff        = results.get("force_field_name", "N/A")
     drag_axis = results.get("drag_axis", np.array([1., 0., 0.]))
     lift_axis = results.get("lift_axis", np.array([0., 0., 1.]))
+    q_inf     = results.get("q_inf_pa", float("nan"))
+    CD        = results.get("CD",       float("nan"))
+    CL        = results.get("CL",       float("nan"))
+    LD        = results.get("LD",       float("nan"))
 
     print(f"  Alpha (AoA)         : {alpha:+.4f} deg")
     if v_inf:
         print(f"  Freestream V∞       : {v_inf:.4f} m/s  (along drag axis)")
+    print(f"  Dynamic pressure q∞ : {q_inf:.4f} Pa")
 
     print(f"\n  Body-frame force    : [{total[0]:+.5g}, "
           f"{total[1]:+.5g}, {total[2]:+.5g}] N")
 
-    print(f"\n  {'Component':<26s}  {'Force [N]':>12s}")
-    print(f"  {'─'*26}  {'─'*12}")
-    print(f"  {'Drag  (freestream)':<26s}  {drag:>+12.4f}")
-    print(f"  {'Lift  (perpendicular)':<26s}  {lift:>+12.4f}")
-    print(f"  {'Side  (spanwise)':<26s}  {span:>+12.4f}")
+    print(f"\n  {'Component':<26s}  {'Force [N]':>12s}  {'Coefficient':>12s}")
+    print(f"  {'─'*26}  {'─'*12}  {'─'*12}")
+    print(f"  {'Drag  (freestream)':<26s}  {drag:>+12.4f}  CD = {CD:>+.6f}")
+    print(f"  {'Lift  (perpendicular)':<26s}  {lift:>+12.4f}  CL = {CL:>+.6f}")
+    print(f"  {'Side  (spanwise)':<26s}  {span:>+12.4f}  (no coeff)")
+
+    print(f"\n  L/D                 : {LD:.4f}  (CL/CD = {CL:.6f} / {CD:.6f})")
 
     print(f"\n  Source              : '{ff}'  ({n_ib:,} IB pts summed)")
 
@@ -648,7 +674,8 @@ def main():
         sys.exit(1)
 
     surface = compute_surface(mesh, fields)
-    results = compute_forces(mesh, fields, ALPHA_DEG)
+    results = compute_forces(mesh, fields, ALPHA_DEG,
+                             v_inf_ref=V_INF, rho=RHO, s_ref=S_REF)
     print_summary(results)
 
     return mesh, fields, surface, results
