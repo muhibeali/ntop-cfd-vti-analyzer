@@ -4,75 +4,56 @@ nTop LBM CFD VTI File Analyzer
 Reads a .vti (VTK ImageData) file exported from an nTop Lattice-Boltzmann
 CFD simulation and reports aerodynamic forces directly from the simulation.
 
-Coordinate system
------------------
-  +X  →  Streamwise / drag direction  (freestream flows in +X direction)
-  +Z  ↑  Vertical   / lift direction
-  +Y  ·  Spanwise   / side force direction
+Coordinate system  (body-fixed, matches nTop default)
+------------------------------------------------------
+  +X  →  Streamwise  (body reference axis, freestream at alpha = 0)
+  +Z  ↑  Vertical    (lift direction at alpha = 0)
+  +Y  ·  Spanwise    (right-hand rule: Y = Z × X)
 
 Sign convention
 ---------------
-  Drag  : positive in +X  (force opposing forward motion)
-  Lift  : positive in +Z  (upward force)
-  Side  : positive in +Y  (positive spanwise)
+  Drag  : positive force in freestream direction  (opposes forward motion)
+  Lift  : positive force perpendicular to freestream, upward
+  Side  : positive force in +Y direction
 
-Force field units
------------------
-  The 'Force time-averaged' field is assumed to be stored in Newtons [N]
-  per immersed-boundary (IB) grid cell.  Summing this field over the IB
-  interface layer gives the total aerodynamic force directly.
+Angle of attack  (nTop convention)
+------------------------------------
+  Positive alpha rotates the FREESTREAM from +X toward +Z in the XZ plane.
+  The body geometry stays fixed; only the inflow velocity direction changes.
+  This matches the nTop Aircraft Flow Analysis block setting.
 
-  If the field is stored as force density [N/m³] instead, each cell value
-  must be multiplied by the cell volume before summing.  The code prints
-  the cell volume and per-cell force magnitude range so this assumption
-  can be verified at runtime.
+  At alpha degrees, the wind axes in body-frame coordinates are:
+    drag axis = [cos(alpha),  0,  sin(alpha)]
+    lift axis = [-sin(alpha), 0,  cos(alpha)]
 
-Why 'Force time-averaged' is the authoritative force source
------------------------------------------------------------
-  nTop's immersed-boundary LBM solver writes this field directly from the
-  IB kernel.  It is preferred over surface pressure integration because:
+Force field — authoritative source
+------------------------------------
+  'Force time-averaged' (point data, shape (N_pts, 3), float64, [N/point])
+  Written by nTop's IB solver kernel.  Non-zero only where CellRegion == 3
+  (~35 k points).  Summing over those points gives the total aerodynamic
+  force including both pressure (form) and viscous (friction) contributions.
 
-    1. It captures both pressure (form) and viscous (friction) forces in
-       a single field — no surface reconstruction or decomposition needed.
+  Preferred over pressure integration because:
+    1. No surface reconstruction needed.
+    2. Not affected by nTop's p=0 BC inside the solid body.
+    3. IB interface layer is compact and free of domain-wall contamination.
 
-    2. It is unaffected by nTop's boundary condition that sets pressure
-       to zero inside the solid body.  Surface pressure sampling averages
-       fluid and zero values near the wall, systematically underestimating
-       the true aerodynamic loading.
+nTop LBM field inventory  (all stored as POINT DATA)
+------------------------------------------------------
+  ImplicitField          (N,)    float32  signed-distance: <0 fluid, >0 solid
+  CellRegion             (N,)    uint8    0=outer, 1=fluid, 3=IB, 4/5=BC, 6=near-body
+  Pressure time-averaged (N,)    float64  [Pa]
+  Velocity time-averaged (N, 3)  float64  [m/s]
+  Force time-averaged    (N, 3)  float64  [N per grid point]
 
-    3. The IB interface cells (CellRegion == 3) are a clearly defined,
-       compact layer around the body — not the full domain — so the sum
-       is uncontaminated by domain-wall effects.
-
-nTop LBM field reference
--------------------------
-  ImplicitField
-      Signed-distance field of the geometry.
-      < 0  →  fluid domain
-      = 0  →  body wall
-      > 0  →  inside solid body
-
-  CellRegion
-      Region label for each grid cell.
-      0      : outer boundary
-      1      : main fluid domain
-      3      : IB fluid-solid interface layer  ← Force field is non-zero here
-      4, 5   : inflow / outflow boundary patches
-      6      : near-body fluid layer
-
-  Force time-averaged [N per IB cell]
-      Aerodynamic force stored by the IB solver.
-      Non-zero only in CellRegion == 3 (~36 k cells out of 26 M total).
-
-  The outer domain walls are also treated as solid boundaries, so a naive
-  ImplicitField = 0 contour spans the FULL domain bounding box (~20 m²).
-  The correct body surface is obtained by clipping that contour to the
-  bounding box of the CellRegion == 3 cells (~0.96 m²).
+  Domain walls are also solid in nTop's IB formulation, so the naive
+  ImplicitField=0 iso-surface spans the full domain (~20 m²).  The body
+  surface is recovered by clipping to the bounding box of CellRegion==3.
 
 Usage
 -----
-  python analyze_cfd_vti.py [path/to/file.vti]
-  Or set VTI_FILE inside main() below.
+  Edit VTI_FILE and ALPHA_DEG in the configuration block below, then run:
+    python analyze_cfd_vti.py
 """
 
 import sys
@@ -80,22 +61,23 @@ import numpy as np
 import pyvista as pv
 from pathlib import Path
 
-# Encode output as UTF-8 so special characters render on Windows
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  Global configuration  (edit these before running)
+#  USER CONFIGURATION — edit these values before running
 # ──────────────────────────────────────────────────────────────────────────────
 
-# Freestream (drag) direction unit vector — +X is streamwise
-DRAG_DIRECTION = np.array([1.0, 0.0, 0.0])
+VTI_FILE = "CFD ATAS 0.006 at 2.5 deg Implicit.vti"  # path to the .vti file
+ALPHA_DEG = 2.5                                        # angle of attack [deg]
+                                                       # positive = freestream
+                                                       # tilts from +X toward +Z
 
-# Lift direction unit vector — must be perpendicular to DRAG_DIRECTION
-LIFT_DIRECTION = np.array([0.0, 0.0, 1.0])
+# Body-axis reference directions (matches nTop default coordinate system)
+DRAG_DIRECTION = np.array([1.0, 0.0, 0.0])   # body +X — streamwise reference
+LIFT_DIRECTION = np.array([0.0, 0.0, 1.0])   # body +Z — vertical reference
 
-# Field-name candidates searched in order for auto-detection.
-# Exact match is tried first, then case-insensitive substring fallback.
+# Field-name candidates (exact match tried first, then case-insensitive substring)
 _FORCE_CANDIDATES = [
     "Force time-averaged", "Force Time-Averaged",
     "Force initial",       "Force",
@@ -113,11 +95,7 @@ _VELOCITY_CANDIDATES = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _find_field(fields: dict, candidates: list) -> tuple:
-    """
-    Return (name, array) for the first candidate found in *fields*.
-    Search order: exact match → case-insensitive substring.
-    Returns (None, None) if no match is found.
-    """
+    """Return (name, array) for the first matching candidate, else (None, None)."""
     for name in candidates:
         if name in fields:
             return name, fields[name]
@@ -131,445 +109,364 @@ def _find_field(fields: dict, candidates: list) -> tuple:
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
-    """Return unit vector; raise if near-zero."""
+    """Return normalised vector; raise ValueError if magnitude is near zero."""
     n = np.linalg.norm(v)
     if n < 1e-12:
-        raise ValueError(f"Direction vector {v} has near-zero magnitude.")
+        raise ValueError(f"Direction vector has near-zero magnitude: {v}")
     return v / n
 
 
 def _orthogonalise(v: np.ndarray, ref: np.ndarray) -> np.ndarray:
-    """Remove the component of *v* along *ref* (Gram-Schmidt) and normalise."""
-    v = v - np.dot(v, ref) * ref
-    return _unit(v)
+    """Gram-Schmidt: remove component of v along ref, then normalise."""
+    return _unit(v - np.dot(v, ref) * ref)
+
+
+def _aero_axes(drag_ref: np.ndarray,
+               lift_ref: np.ndarray,
+               alpha_deg: float) -> tuple:
+    """
+    Rotate body-axis references into wind (aerodynamic) axes.
+
+    nTop convention: positive alpha tilts the freestream from +X toward +Z.
+    Equivalent to applying Ry(-alpha) to the body axes:
+
+      drag_aero = cos(alpha) * drag_ref + sin(alpha) * lift_ref
+      lift_aero = -sin(alpha) * drag_ref + cos(alpha) * lift_ref
+
+    Verification at alpha=10 deg (drag_ref=+X, lift_ref=+Z):
+      drag_aero = [+0.985, 0, +0.174]   (tilted toward +Z)
+      lift_aero = [-0.174, 0, +0.985]   (tilted toward -X)
+    """
+    d = _unit(drag_ref.copy())
+    l = _unit(lift_ref.copy())
+    if alpha_deg == 0.0:
+        return d, _orthogonalise(l, d)
+    a = np.radians(alpha_deg)
+    return _unit(np.cos(a) * d + np.sin(a) * l), \
+           _unit(-np.sin(a) * d + np.cos(a) * l)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  1.  load_vti()
+#  1.  load_vti
 # ──────────────────────────────────────────────────────────────────────────────
 
 def load_vti(filepath: str) -> pv.ImageData:
     """
-    Load a VTK ImageData (.vti) file and print a concise mesh summary.
-
-    Parameters
-    ----------
-    filepath : str
-        Path to the .vti file.
+    Read a .vti file with PyVista and print a mesh summary.
 
     Returns
     -------
     pv.ImageData
-        The loaded PyVista dataset.
     """
     path = Path(filepath)
     if not path.exists():
         raise FileNotFoundError(f"File not found: {filepath}")
     if path.suffix.lower() not in (".vti", ".vtk"):
-        print(f"  [warn] Expected .vti extension, got '{path.suffix}'")
+        print(f"  [warn] Unexpected extension '{path.suffix}' — expected .vti")
 
     print(f"\n{'='*64}")
     print(f"  FILE       : {path.resolve()}")
     print(f"{'='*64}")
 
     mesh = pv.read(str(path))
+    b    = np.array(mesh.bounds).reshape(3, 2)
 
-    b = np.array(mesh.bounds).reshape(3, 2)
     print(f"  Type       : {type(mesh).__name__}")
     if hasattr(mesh, "dimensions"):
         print(f"  Dimensions : {mesh.dimensions}  (nx, ny, nz)")
     if hasattr(mesh, "spacing"):
         sx, sy, sz = mesh.spacing
         print(f"  Spacing    : ({sx:.5g}, {sy:.5g}, {sz:.5g}) m")
-        cell_vol = sx * sy * sz
-        print(f"  Cell volume: {cell_vol:.5g} m³")
-    print(f"  Domain X   : [{b[0,0]:.5g}, {b[0,1]:.5g}] m  "
-          f"(span {b[0,1]-b[0,0]:.4g} m)")
-    print(f"  Domain Y   : [{b[1,0]:.5g}, {b[1,1]:.5g}] m  "
-          f"(span {b[1,1]-b[1,0]:.4g} m)")
-    print(f"  Domain Z   : [{b[2,0]:.5g}, {b[2,1]:.5g}] m  "
-          f"(span {b[2,1]-b[2,0]:.4g} m)")
+        print(f"  Cell vol   : {sx*sy*sz:.5g} m³")
+    print(f"  Domain X   : [{b[0,0]:.4g}, {b[0,1]:.4g}] m  "
+          f"span {b[0,1]-b[0,0]:.4g} m")
+    print(f"  Domain Y   : [{b[1,0]:.4g}, {b[1,1]:.4g}] m  "
+          f"span {b[1,1]-b[1,0]:.4g} m")
+    print(f"  Domain Z   : [{b[2,0]:.4g}, {b[2,1]:.4g}] m  "
+          f"span {b[2,1]-b[2,0]:.4g} m")
     print(f"  N points   : {mesh.n_points:,}")
     print(f"  N cells    : {mesh.n_cells:,}")
-
     return mesh
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  2.  extract_fields()
+#  2.  extract_fields
 # ──────────────────────────────────────────────────────────────────────────────
 
 def extract_fields(mesh: pv.ImageData) -> dict:
     """
-    Collect every data array from the VTI mesh into NumPy arrays.
+    Collect every data array from the VTI mesh into a flat dict of NumPy arrays.
 
-    Prints a formatted table for each data container (point data, cell data,
-    field/metadata) showing:  name · kind (scalar/vector) · shape · dtype ·
-    value range · NaN/Inf count.
-
-    Parameters
-    ----------
-    mesh : pv.ImageData
-        The loaded VTI dataset.
+    For nTop LBM files all data lives in mesh.point_data.
+    Cell data and field data containers are empty.
 
     Returns
     -------
-    dict
-        Flat dictionary  { field_name: numpy_array }  covering all containers.
-        Scalars have shape (N,), vectors shape (N, k).
-
-    Notes for nTop LBM files
-    ------------------------
-    Typical fields present:
-      ImplicitField          – signed-distance function  (fluid < 0, solid > 0)
-      CellRegion             – region label  (0–6, see module docstring)
-      Velocity initial       – velocity at t = 0
-      Velocity time-averaged – time-averaged velocity
-      Force time-averaged    – aerodynamic body force per IB cell [N]
+    dict  { field_name: np.ndarray }
+        Scalars shape (N,), vectors shape (N, 3).
     """
 
-    def _inspect(container: pv.DataSetAttributes, label: str) -> dict:
-        """Print stats for one data container and return its numpy arrays."""
-        out: dict = {}
+    def _inspect(container: pv.DataSetAttributes) -> dict:
+        out = {}
         if len(container) == 0:
-            print(f"    (none)")
+            print("    (none)")
             return out
         for name in container.keys():
-            arr  = np.array(container[name])
+            arr  = np.asarray(container[name])
             flat = arr.ravel()
             fin  = flat[np.isfinite(flat)]
-            if fin.size:
-                v_rng = f"[{fin.min():.5g}, {fin.max():.5g}]"
-            else:
-                v_rng = "all NaN/Inf"
-            nnan = int(np.sum(~np.isfinite(flat)))
+            rng  = f"[{fin.min():.5g}, {fin.max():.5g}]" if fin.size else "all NaN/Inf"
+            nnan = int((~np.isfinite(flat)).sum())
             kind = "scalar" if arr.ndim == 1 else f"vec{arr.shape[1]}"
             nan_tag = f"  <- {nnan} NaN/Inf" if nnan else ""
-            print(f"    {name:<40s}  {kind:<8s}  "
-                  f"shape={str(arr.shape):<20s}  "
-                  f"dtype={str(arr.dtype):<10s}  "
-                  f"range={v_rng}{nan_tag}")
+            print(f"    {name:<40s}  {kind:<8s}  shape={str(arr.shape):<20s}"
+                  f"  dtype={str(arr.dtype):<10s}  range={rng}{nan_tag}")
             out[name] = arr
         return out
 
     all_fields: dict = {}
 
-    # ── Point data ─────────────────────────────────────────────────────────
     print(f"\n{'─'*64}")
-    print("  POINT DATA  (one value per mesh node)")
+    print("  POINT DATA")
     print(f"{'─'*64}")
-    all_fields.update(_inspect(mesh.point_data, "point"))
+    all_fields.update(_inspect(mesh.point_data))
 
-    # ── Cell data ──────────────────────────────────────────────────────────
     print(f"\n{'─'*64}")
-    print("  CELL DATA   (one value per grid cell)")
+    print("  CELL DATA")
     print(f"{'─'*64}")
-    all_fields.update(_inspect(mesh.cell_data, "cell"))
+    all_fields.update(_inspect(mesh.cell_data))
 
-    # ── Field metadata ─────────────────────────────────────────────────────
     print(f"\n{'─'*64}")
     print("  FIELD / METADATA")
     print(f"{'─'*64}")
-    all_fields.update(_inspect(mesh.field_data, "field"))
+    all_fields.update(_inspect(mesh.field_data))
 
-    # ── Quick summary of key nTop fields ──────────────────────────────────
+    # ── Key field summary ─────────────────────────────────────────────────
     print(f"\n  {'─'*60}")
     print("  KEY FIELD SUMMARY (nTop LBM)")
     print(f"  {'─'*60}")
 
     impl = all_fields.get("ImplicitField")
     if impl is not None:
-        n_fluid = int((impl < 0).sum())
-        n_wall  = int((np.abs(impl) < 0.007).sum())
-        n_solid = int((impl > 0).sum())
-        print(f"  ImplicitField  ->  fluid (< 0): {n_fluid:,}  "
-              f"wall (~0): {n_wall:,}  solid (> 0): {n_solid:,}")
+        print(f"  ImplicitField  ->  "
+              f"fluid (<0): {int((impl < 0).sum()):,}  "
+              f"wall (~0): {int((np.abs(impl) < 0.007).sum()):,}  "
+              f"solid (>0): {int((impl > 0).sum()):,}")
 
     creg = all_fields.get("CellRegion")
     if creg is not None:
-        unique_vals = np.unique(creg.astype(int))
-        region_desc = {0: "outer BC", 1: "fluid", 3: "IB interface",
-                       4: "inlet/outlet", 5: "inlet/outlet", 6: "near-body fluid"}
-        for v in unique_vals:
-            desc = region_desc.get(v, "unknown")
-            print(f"  CellRegion {v}   ->  {(creg == v).sum():>12,} pts  ({desc})")
+        region_label = {0: "outer BC", 1: "fluid", 3: "IB interface",
+                        4: "inlet/outlet", 5: "inlet/outlet", 6: "near-body fluid"}
+        for v in np.unique(creg.astype(int)):
+            print(f"  CellRegion {v}   ->  "
+                  f"{int((creg == v).sum()):>12,} pts  "
+                  f"({region_label.get(v, 'unknown')})")
 
     v_name, v_arr = _find_field(all_fields, _VELOCITY_CANDIDATES)
     f_name, f_arr = _find_field(all_fields, _FORCE_CANDIDATES)
 
     if v_name and v_arr is not None and v_arr.ndim == 2:
         vmag = np.linalg.norm(v_arr, axis=1)
-        print(f"  Velocity field : '{v_name}'  "
-              f"speed range [{vmag.min():.4g}, {vmag.max():.4g}] m/s")
-    if f_name and f_arr is not None and f_arr.ndim == 2:
-        fmag     = np.linalg.norm(f_arr, axis=1)
-        n_nonzero = int((fmag > 1e-8).sum())
-        print(f"  Force field    : '{f_name}'  "
-              f"non-zero cells: {n_nonzero:,}")
+        print(f"  Velocity       : '{v_name}'  "
+              f"|v| range [{vmag.min():.4g}, {vmag.max():.4g}] m/s")
 
-    print(f"\n  All field keys: {list(all_fields.keys())}")
+    if f_name and f_arr is not None and f_arr.ndim == 2:
+        fmag = np.linalg.norm(f_arr, axis=1)
+        print(f"  Force          : '{f_name}'  "
+              f"non-zero pts: {int((fmag > 1e-8).sum()):,}")
+
+    print(f"\n  All field keys : {list(all_fields.keys())}")
     return all_fields
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  3.  compute_surface()
+#  3.  compute_surface
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_surface(mesh: pv.ImageData, fields: dict) -> pv.PolyData:
     """
-    Reconstruct the aerodynamic body surface from the volume data.
+    Reconstruct the body-only surface from the volume data.
 
-    Why naive contouring fails for nTop LBM
-    ----------------------------------------
-    nTop treats the outer domain walls as solid boundaries, so the
-    ImplicitField = 0 iso-surface spans the ENTIRE domain bounding box
-    (~20 m²) instead of just the body (~0.96 m²).
-
-    Correct extraction procedure
-    ----------------------------
-    1. Identify the IB interface layer (CellRegion == 3).  These points
-       exist only around the actual body, not on domain walls.
-    2. Compute the body's tight bounding box from those points.
-    3. Extract the smooth ImplicitField = 0 iso-surface (marching cubes).
-    4. Clip the iso-surface to the bounding box → body-only surface.
-    5. Compute outward cell normals and validate their orientation.
-
-    Parameters
-    ----------
-    mesh   : pv.ImageData  full-volume VTI mesh.
-    fields : dict          all extracted numpy arrays from extract_fields().
+    Strategy
+    --------
+    1. Locate the body via CellRegion==3 points (IB interface layer).
+       These exist only around the body, not at domain walls.
+    2. Build a tight bounding box around those points.
+    3. Extract ImplicitField=0 iso-surface (marching cubes) over the full domain.
+    4. Clip to the bounding box to remove domain-wall triangles.
+    5. Compute outward cell normals; validate and flip if inverted.
 
     Returns
     -------
     pv.PolyData
-        Triangulated body surface with:
-          • "Normals"  (N, 3)  outward cell normals.
-          • "Area"     (N,)    cell areas [m²].
-          • field_data["total_area_m2"] stored for reference.
+        Triangulated body surface with cell_data["Normals"] and ["Area"],
+        and field_data["total_area_m2"].
     """
     print(f"\n{'─'*64}")
-    print("  SURFACE EXTRACTION  (nTop LBM body-only method)")
+    print("  SURFACE EXTRACTION  (nTop body-only method)")
     print(f"{'─'*64}")
 
-    pts = mesh.points
+    pts     = mesh.points
+    impl    = fields.get("ImplicitField")
+    creg    = fields.get("CellRegion")
+    _, farr = _find_field(fields, _FORCE_CANDIDATES)
 
-    # ── Step 1: Locate the actual body via IB interface cells ──────────────
-    creg_arr = fields.get("CellRegion")
-    f_name, f_arr = _find_field(fields, _FORCE_CANDIDATES)
-    impl_arr = fields.get("ImplicitField")
-
+    # ── Locate body ───────────────────────────────────────────────────────
     body_mask = None
+    if creg is not None:
+        m = np.asarray(creg, dtype=int) == 3
+        if m.sum() > 0:
+            body_mask = m
+            print(f"  Body via CellRegion==3       : {m.sum():,} pts")
 
-    # Priority 1: CellRegion == 3  (IB interface — most reliable nTop marker)
-    if creg_arr is not None:
-        mask3 = np.array(creg_arr, dtype=int) == 3
-        if mask3.sum() > 0:
-            body_mask = mask3
-            print(f"  Body located via CellRegion == 3  ({mask3.sum():,} pts)")
+    if body_mask is None and farr is not None and farr.ndim == 2:
+        m = np.linalg.norm(farr, axis=1) > 1e-8
+        body_mask = m
+        print(f"  Body via |Force|>0           : {m.sum():,} pts")
 
-    # Priority 2: Non-zero Force cells
-    if body_mask is None and f_arr is not None and f_arr.ndim == 2:
-        fmag = np.linalg.norm(f_arr, axis=1)
-        body_mask = fmag > 1e-8
-        print(f"  Body located via |Force| > 0  ({body_mask.sum():,} pts)")
-
-    # Priority 3: ImplicitField > 0 (inside solid)
-    if body_mask is None and impl_arr is not None:
-        body_mask = np.array(impl_arr) > 0
-        print(f"  Body located via ImplicitField > 0  ({body_mask.sum():,} pts)")
+    if body_mask is None and impl is not None:
+        body_mask = np.asarray(impl) > 0
+        print(f"  Body via ImplicitField>0     : {body_mask.sum():,} pts")
 
     if body_mask is None or body_mask.sum() == 0:
-        raise RuntimeError("Cannot locate body in mesh. "
-                           "Ensure ImplicitField or CellRegion is present.")
+        raise RuntimeError("Cannot locate body. Ensure ImplicitField or CellRegion is present.")
 
-    # ── Step 2: Bounding box with margin ──────────────────────────────────
-    body_pts = pts[body_mask]
-    cell_sz  = max(getattr(mesh, "spacing", (0.01, 0.01, 0.01)))
-    margin   = 3.0 * cell_sz
-
-    bb = [
-        float(body_pts[:, 0].min()) - margin,
-        float(body_pts[:, 0].max()) + margin,
-        float(body_pts[:, 1].min()) - margin,
-        float(body_pts[:, 1].max()) + margin,
-        float(body_pts[:, 2].min()) - margin,
-        float(body_pts[:, 2].max()) + margin,
-    ]
-    print(f"  Body bounding box : "
+    # ── Bounding box + margin ─────────────────────────────────────────────
+    bp     = pts[body_mask]
+    margin = 3.0 * max(getattr(mesh, "spacing", (0.01, 0.01, 0.01)))
+    bb     = [bp[:,0].min()-margin, bp[:,0].max()+margin,
+              bp[:,1].min()-margin, bp[:,1].max()+margin,
+              bp[:,2].min()-margin, bp[:,2].max()+margin]
+    print(f"  Body bounding box            : "
           f"X=[{bb[0]:.4g},{bb[1]:.4g}]  "
           f"Y=[{bb[2]:.4g},{bb[3]:.4g}]  "
-          f"Z=[{bb[4]:.4g},{bb[5]:.4g}]  m")
+          f"Z=[{bb[4]:.4g},{bb[5]:.4g}] m")
 
-    # ── Step 3 & 4: ImplicitField = 0 contour, then clip ──────────────────
+    # ── Iso-surface + clip ────────────────────────────────────────────────
     surface = None
-
-    if impl_arr is not None:
-        print("  Extracting ImplicitField = 0 iso-surface (marching cubes)...")
+    if impl is not None:
+        print("  Marching cubes on ImplicitField=0 ...")
         try:
-            full_iso = mesh.contour([0.0], scalars="ImplicitField")
-            n_full   = full_iso.n_cells
-            print(f"  Full iso-surface (incl. domain walls): {n_full:,} triangles")
-
-            # Clip to body bounding box — removes domain-wall triangles
-            clipped = full_iso.clip_box(bb, invert=False)
-
-            # clip_box may return UnstructuredGrid; convert to triangulated PolyData
+            full = mesh.contour([0.0], scalars="ImplicitField")
+            print(f"  Full iso-surface             : {full.n_cells:,} triangles"
+                  f" (includes domain walls)")
+            clipped = full.clip_box(bb, invert=False)
             if not isinstance(clipped, pv.PolyData):
-                clipped = clipped.extract_surface(
-                    algorithm="dataset_surface"
-                ).triangulate()
+                clipped = clipped.extract_surface(algorithm="dataset_surface").triangulate()
             else:
                 clipped = clipped.triangulate()
-
             if clipped.n_cells > 0:
                 surface = clipped
-                print(f"  Body-only iso-surface (clipped)      : "
+                print(f"  Body-only surface (clipped)  : "
                       f"{surface.n_cells:,} triangles  {surface.n_points:,} pts")
             else:
-                print("  [warn] Clipped iso-surface is empty — trying fallback.")
+                print("  [warn] Clipped iso-surface empty — falling back.")
         except Exception as e:
-            print(f"  [warn] Iso-surface extraction failed: {e}")
+            print(f"  [warn] Iso-surface failed: {e}")
 
-    # Fallback: voxelised body surface from cell threshold
+    # ── Fallback: voxelised surface ───────────────────────────────────────
     if surface is None or surface.n_cells == 0:
-        print("  Fallback: cell threshold (ImplicitField > 0) + extract_surface...")
+        print("  Fallback: voxelised surface from cell threshold ...")
         try:
-            mesh_cell  = mesh.point_data_to_cell_data()
-            solid      = mesh_cell.threshold(
-                value=0.0, scalars="ImplicitField",
-                preference="cell", invert=False,
-            )
-            solid_clip = solid.clip_box(bb, invert=False)
-            surface    = solid_clip.extract_surface(
-                algorithm="dataset_surface"
-            ).triangulate()
-            print(f"  Voxelised body surface : {surface.n_cells:,} faces")
+            mc   = mesh.point_data_to_cell_data()
+            sol  = mc.threshold(0.0, scalars="ImplicitField", preference="cell", invert=False)
+            clip = sol.clip_box(bb, invert=False)
+            surface = clip.extract_surface(algorithm="dataset_surface").triangulate()
+            print(f"  Voxelised surface            : {surface.n_cells:,} faces")
         except Exception as e:
-            raise RuntimeError(
-                f"Surface extraction failed: {e}. "
-                "Verify that ImplicitField is present in the VTI file."
-            ) from e
+            raise RuntimeError(f"Surface extraction failed: {e}") from e
 
-    # ── Step 5: Compute normals and cell areas ─────────────────────────────
-    surface = surface.compute_normals(
-        cell_normals=True, point_normals=False,
-        consistent_normals=True,
-        auto_orient_normals=True,
-        flip_normals=False,
-    )
+    # ── Normals and areas ─────────────────────────────────────────────────
+    surface = surface.compute_normals(cell_normals=True, point_normals=False,
+                                      consistent_normals=True,
+                                      auto_orient_normals=True,
+                                      flip_normals=False)
     surface = surface.compute_cell_sizes(length=False, area=True, volume=False)
 
-    normals    = np.array(surface.cell_data["Normals"], dtype=float)   # (M, 3)
-    areas      = np.array(surface.cell_data["Area"],    dtype=float)   # (M,)
+    normals    = np.asarray(surface.cell_data["Normals"], dtype=float)
+    areas      = np.asarray(surface.cell_data["Area"],    dtype=float)
     total_area = float(areas.sum())
+    mean_n     = normals.mean(axis=0)
+    b_s        = np.array(surface.bounds).reshape(3, 2)
 
-    mean_n = normals.mean(axis=0)
-    b_s    = np.array(surface.bounds).reshape(3, 2)
-
-    print(f"\n  Surface bounds    : "
+    print(f"\n  Surface bounds               : "
           f"X=[{b_s[0,0]:.4g},{b_s[0,1]:.4g}]  "
           f"Y=[{b_s[1,0]:.4g},{b_s[1,1]:.4g}]  "
-          f"Z=[{b_s[2,0]:.4g},{b_s[2,1]:.4g}]  m")
-    print(f"  Total surface area: {total_area:.5g} m²")
-    print(f"  Mean cell normal  : [{mean_n[0]:+.4g}, {mean_n[1]:+.4g}, "
-          f"{mean_n[2]:+.4g}]  (near [0,0,0] for a closed surface)")
+          f"Z=[{b_s[2,0]:.4g},{b_s[2,1]:.4g}] m")
+    print(f"  Total surface area           : {total_area:.5g} m²")
+    print(f"  Mean cell normal             : [{mean_n[0]:+.4g}, {mean_n[1]:+.4g},"
+          f" {mean_n[2]:+.4g}]  (near zero for closed surface)")
 
-    # ── Step 6: Validate outward normal orientation ────────────────────────
-    # For each surface cell, the vector from the body centroid to the cell
-    # centre should align with the outward normal.  A high fraction of
-    # misaligned normals indicates the surface was reconstructed inside-out.
-    body_centroid = body_pts.mean(axis=0)
-    cell_centres  = np.array(surface.cell_centers().points)
-    radial        = cell_centres - body_centroid
-    radial       /= np.maximum(np.linalg.norm(radial, axis=1, keepdims=True), 1e-12)
-    alignment     = (normals * radial).sum(axis=1)
-    frac_outward  = float((alignment > 0).mean())
-
-    print(f"\n  Normal orientation check:")
-    print(f"    Cells with outward-facing normals : {100*frac_outward:.1f}%")
-
-    if frac_outward < 0.5:
-        print("  [warn] Majority of normals appear INWARD — flipping all normals.")
+    # ── Validate outward orientation ──────────────────────────────────────
+    centroid     = bp.mean(axis=0)
+    cc           = np.asarray(surface.cell_centers().points)
+    radial       = cc - centroid
+    radial      /= np.maximum(np.linalg.norm(radial, axis=1, keepdims=True), 1e-12)
+    align        = (normals * radial).sum(axis=1)
+    frac_out     = float((align > 0).mean())
+    print(f"\n  Normal orientation check     : {100*frac_out:.1f}% outward-facing")
+    if frac_out < 0.5:
+        print("  [warn] Majority inward — flipping all normals.")
         surface.cell_data["Normals"] = -normals
-    elif frac_outward < 0.8:
-        print("  [warn] More than 20% of normals may be inverted. "
-              "Surface reconstruction may be incomplete.")
+    elif frac_out < 0.8:
+        print("  [warn] >20% may be inverted — surface reconstruction may be incomplete.")
     else:
-        print("    Normals verified as outward-facing.")
+        print("  Normals confirmed outward.")
 
     surface.field_data["total_area_m2"] = np.array([total_area])
-
     return surface
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  4.  compute_forces()
+#  4.  compute_forces
 # ──────────────────────────────────────────────────────────────────────────────
 
-def compute_forces(
-    mesh:     pv.ImageData,
-    fields:   dict,
-    drag_dir: np.ndarray = DRAG_DIRECTION,
-    lift_dir: np.ndarray = LIFT_DIRECTION,
-) -> dict:
+def compute_forces(mesh:      pv.ImageData,
+                   fields:    dict,
+                   alpha_deg: float,
+                   drag_dir:  np.ndarray = DRAG_DIRECTION,
+                   lift_dir:  np.ndarray = LIFT_DIRECTION) -> dict:
     """
-    Compute aerodynamic forces by summing 'Force time-averaged' over the
-    immersed-boundary (IB) interface layer.
+    Sum 'Force time-averaged' over the IB interface layer to get aerodynamic forces.
 
-    This is the sole force computation method for nTop LBM data.
-    See the module docstring for why this field is the authoritative source.
+    Forces in the VTI are in body-fixed coordinates.  alpha_deg rotates the
+    projection axes into wind axes so that drag is along the freestream and
+    lift is perpendicular to it.
 
-    IB interface detection
-    ----------------------
-    Primary detection uses cells where |Force time-averaged| exceeds a
-    noise threshold derived from the field's own maximum value.
-
-    Cross-check: if CellRegion == 3 is present, the two masks are compared.
-    If they agree to within 80%, the CellRegion label is used (it is an
-    explicit solver label).  If they disagree significantly, the
-    force-magnitude mask is used and a warning is issued — this guards
-    against future nTop versions that may change region numbering.
-
-    Unit verification
-    -----------------
-    The code prints the cell volume alongside the mean per-cell force
-    magnitude so you can verify the unit assumption (N/cell vs N/m³).
-    If the field is in N/m³, set FORCE_IS_DENSITY = True in main() and
-    the code will multiply by cell volume before summing.
+    IB detection
+    ------------
+    Primary  : |Force| > 0.1% of max value.
+    Fallback : CellRegion == 3 (cross-checked; warning if >20% disagreement).
 
     Parameters
     ----------
-    mesh     : pv.ImageData  full-volume VTI mesh.
-    fields   : dict          all numpy arrays from extract_fields().
-    drag_dir : (3,) array    drag (freestream) direction unit vector.
-    lift_dir : (3,) array    lift direction unit vector.
+    mesh      : pv.ImageData
+    fields    : dict from extract_fields()
+    alpha_deg : float  angle of attack [deg]; positive = freestream toward +Z
+    drag_dir  : (3,) body-axis drag reference  (default +X)
+    lift_dir  : (3,) body-axis lift reference  (default +Z)
 
     Returns
     -------
-    dict  with keys:
-        "total_force_N"    – (3,) total aerodynamic force vector [N]
-        "drag_N"           – drag component along drag_dir [N]
-        "lift_N"           – lift component along lift_dir [N]
-        "span_N"           – side/span component [N]
-        "n_ib_cells"       – number of IB interface cells summed
-        "force_field_name" – name of the force field detected
-        "v_inf_ms"         – freestream velocity component along drag_dir [m/s]
-        "n_upstream_pts"   – upstream fluid points used for V∞ estimate
+    dict
+        total_force_N, drag_N, lift_N, span_N, n_ib_pts,
+        force_field_name, v_inf_ms, n_upstream_pts,
+        alpha_deg, drag_axis, lift_axis
     """
     print(f"\n{'─'*64}")
     print("  FORCE COMPUTATION")
     print(f"{'─'*64}")
 
-    # ── Direction vectors ──────────────────────────────────────────────────
-    drag_dir = _unit(drag_dir.copy())
-    lift_dir = _orthogonalise(lift_dir.copy(), drag_dir)
-    span_dir = np.cross(drag_dir, lift_dir)
+    # ── Wind axes ─────────────────────────────────────────────────────────
+    drag_dir, lift_dir = _aero_axes(drag_dir, lift_dir, alpha_deg)
+    span_dir           = np.cross(drag_dir, lift_dir)
 
-    print(f"  Drag direction : {drag_dir}")
-    print(f"  Lift direction : {lift_dir}")
-    print(f"  Span direction : {span_dir}")
+    print(f"  Alpha (AoA)    : {alpha_deg:+.4f} deg")
+    print(f"  Drag axis      : [{drag_dir[0]:+.6f}, {drag_dir[1]:+.6f}, {drag_dir[2]:+.6f}]")
+    print(f"  Lift axis      : [{lift_dir[0]:+.6f}, {lift_dir[1]:+.6f}, {lift_dir[2]:+.6f}]")
+    print(f"  Span axis      : [{span_dir[0]:+.6f}, {span_dir[1]:+.6f}, {span_dir[2]:+.6f}]")
 
-    # ── Freestream velocity (context only — not used in force computation) ─
+    # ── Freestream velocity estimate (context only) ───────────────────────
     print(f"\n  {'─'*56}")
     print("  FREESTREAM VELOCITY")
     print(f"  {'─'*56}")
@@ -579,227 +476,179 @@ def compute_forces(
     n_upstream = 0
 
     if v_name and v_vol is not None and v_vol.ndim == 2:
-        print(f"  Velocity field : '{v_name}'")
-
-        impl_arr = fields.get("ImplicitField")
-        pts_vol  = mesh.points
-        bounds   = mesh.bounds
-
-        # Fluid cells: well inside fluid domain (ImplicitField < -0.006)
-        if impl_arr is not None:
-            fluid_mask = np.array(impl_arr) < -0.006
-        else:
-            fluid_mask = np.ones(mesh.n_points, dtype=bool)
-
-        # Upstream strip: lowest 15% of domain X extent
-        x_inlet  = bounds[0] + 0.15 * (bounds[1] - bounds[0])
-        upstream = fluid_mask & (pts_vol[:, 0] <= x_inlet)
-
+        impl_arr   = fields.get("ImplicitField")
+        pts_vol    = mesh.points
+        bounds     = mesh.bounds
+        fluid_mask = (np.asarray(impl_arr) < -0.006
+                      if impl_arr is not None
+                      else np.ones(mesh.n_points, dtype=bool))
+        x_cut      = bounds[0] + 0.15 * (bounds[1] - bounds[0])
+        upstream   = fluid_mask & (pts_vol[:, 0] <= x_cut)
         if upstream.sum() < 100:
             upstream = fluid_mask
-
-        v_up       = v_vol[upstream]
         n_upstream = int(upstream.sum())
-
-        # Project onto drag direction — avoids inflation from cross-flow or
-        # numerical noise in off-axis velocity components
-        v_inf = float(np.mean(v_up @ drag_dir))
-
-        print(f"  Upstream fluid pts   : {n_upstream:,}")
-        print(f"  V∞ (drag direction)  : {v_inf:.4f} m/s")
+        v_inf      = float(np.mean(v_vol[upstream] @ drag_dir))
+        print(f"  Field          : '{v_name}'")
+        print(f"  Upstream pts   : {n_upstream:,}")
+        print(f"  V∞ (drag dir)  : {v_inf:.4f} m/s")
     else:
-        print("  [warn] No vector velocity field found — V∞ not reported.")
+        print("  [warn] No velocity field found — V∞ not reported.")
 
-    # ─────────────────────────────────────────────────────────────────────
-    # AERODYNAMIC FORCES  (Force time-averaged field)
-    # ─────────────────────────────────────────────────────────────────────
+    # ── Force field ───────────────────────────────────────────────────────
     print(f"\n  {'─'*56}")
-    print("  AERODYNAMIC FORCES  (Force time-averaged field)")
+    print("  AERODYNAMIC FORCES")
     print(f"  {'─'*56}")
 
     f_name, f_arr = _find_field(fields, _FORCE_CANDIDATES)
-    total_force   = np.zeros(3)
-    drag = lift = span = 0.0
-    n_ib = 0
+    zeros = np.zeros(3)
 
     if f_name is None or f_arr is None or f_arr.ndim != 2:
         print("  [error] No vector Force field found.")
-        print(f"  Available fields: {list(fields.keys())}")
-        return {
-            "total_force_N":    total_force,
-            "drag_N":           drag,
-            "lift_N":           lift,
-            "span_N":           span,
-            "n_ib_cells":       n_ib,
-            "force_field_name": "",
-            "v_inf_ms":         v_inf,
-            "n_upstream_pts":   n_upstream,
-        }
+        print(f"  Available keys : {list(fields.keys())}")
+        return dict(total_force_N=zeros, drag_N=0., lift_N=0., span_N=0.,
+                    n_ib_pts=0, force_field_name="", v_inf_ms=v_inf,
+                    n_upstream_pts=n_upstream, alpha_deg=alpha_deg,
+                    drag_axis=drag_dir, lift_axis=lift_dir)
 
-    print(f"  Force field : '{f_name}'")
+    print(f"  Field          : '{f_name}'")
 
-    # ── Cell volume — printed for unit verification ────────────────────────
-    cell_vol = None
-    if hasattr(mesh, "spacing"):
-        sx, sy, sz = mesh.spacing
-        cell_vol = sx * sy * sz
-        print(f"  Cell volume : {cell_vol:.5g} m³")
+    # Cell volume for unit-check printout
+    cell_vol = float(np.prod(mesh.spacing)) if hasattr(mesh, "spacing") else None
+    if cell_vol:
+        print(f"  Cell volume    : {cell_vol:.5g} m³")
 
-    # ── Step 1: Detect IB cells via |Force| > noise threshold ─────────────
-    fmag        = np.linalg.norm(f_arr, axis=1)
-    thresh      = max(1e-8, 1e-3 * float(fmag.max()))
-    force_mask  = fmag > thresh
-    n_force_cells = int(force_mask.sum())
-    print(f"  IB cells (|Force| > {thresh:.3g}) : {n_force_cells:,}")
+    # ── IB detection: force-magnitude mask (primary) ──────────────────────
+    fmag       = np.linalg.norm(f_arr, axis=1)
+    thresh     = max(1e-8, 1e-3 * float(fmag.max()))
+    force_mask = fmag > thresh
+    print(f"  |Force|>{thresh:.3g} pts : {int(force_mask.sum()):,}")
 
-    # ── Step 2: Cross-check with CellRegion == 3 ──────────────────────────
+    # ── Cross-check with CellRegion==3 ────────────────────────────────────
     creg_arr   = fields.get("CellRegion")
-    iface_mask = force_mask   # default: use force-magnitude detection
+    iface_mask = force_mask
 
     if creg_arr is not None:
-        mask3        = np.array(creg_arr, dtype=int) == 3
+        mask3        = np.asarray(creg_arr, dtype=int) == 3
         n_creg3      = int(mask3.sum())
         n_overlap    = int((force_mask & mask3).sum())
         overlap_frac = n_overlap / max(n_creg3, 1)
-
-        print(f"  IB cells (CellRegion == 3)     : {n_creg3:,}")
-        print(f"  Overlap between methods        : {n_overlap:,}  "
-              f"({100*overlap_frac:.1f}%)")
-
+        print(f"  CellRegion==3 pts          : {n_creg3:,}")
+        print(f"  Overlap                    : {n_overlap:,}  ({100*overlap_frac:.1f}%)")
         if overlap_frac < 0.80:
-            print(f"  [warn] CellRegion == 3 and |Force| masks differ by more "
-                  f"than 20%.")
-            print(f"  [warn] Using force-magnitude mask.  Verify CellRegion "
-                  f"labelling for this nTop version.")
+            print("  [warn] Masks differ >20% — using force-magnitude mask.")
+            print("  [warn] Verify CellRegion labelling for this nTop version.")
         else:
-            # Both methods agree — prefer the explicit solver label
             iface_mask = mask3
-            print(f"  CellRegion == 3 consistent with |Force| — using it.")
+            print("  CellRegion==3 consistent — using it.")
 
-    # ── Step 3: Unit verification hint ────────────────────────────────────
-    if cell_vol is not None:
-        per_cell_mean = float(fmag[iface_mask].mean())
-        as_density    = per_cell_mean / cell_vol
-        print(f"\n  Per-cell |Force| mean  : {per_cell_mean:.5g} N/cell")
-        print(f"  Equiv. force density   : {as_density:.5g} N/m³")
-        print(f"  (Summing directly is correct if field is in N/cell.)")
-        print(f"  (If field is in N/m³, multiply each value by "
-              f"{cell_vol:.5g} m³ before summing.)")
+    # ── Unit check ────────────────────────────────────────────────────────
+    if cell_vol:
+        pcmean = float(fmag[iface_mask].mean())
+        print(f"\n  Mean |Force| per pt : {pcmean:.5g} N/pt")
+        print(f"  Equiv. density     : {pcmean/cell_vol:.5g} N/m³")
+        print(f"  (Summing is correct if field is N/pt; "
+              f"multiply by {cell_vol:.5g} m³ if N/m³.)")
 
-    # ── Step 4: Sum force over IB interface cells ──────────────────────────
-    F_per_cell  = f_arr[iface_mask]        # (N_ib, 3)  [N/cell]
-    total_force = F_per_cell.sum(axis=0)   # [N]
+    # ── Sum ───────────────────────────────────────────────────────────────
+    F_pts       = f_arr[iface_mask]
+    total_force = F_pts.sum(axis=0)
     n_ib        = int(iface_mask.sum())
 
     drag = float(np.dot(total_force, drag_dir))
     lift = float(np.dot(total_force, lift_dir))
     span = float(np.dot(total_force, span_dir))
 
-    drag_pc = F_per_cell @ drag_dir
-    lift_pc = F_per_cell @ lift_dir
-
-    print(f"\n  IB interface cells  : {n_ib:,}")
-    print(f"  Total force vector  : [{total_force[0]:+.5g}, "
+    print(f"\n  IB interface pts    : {n_ib:,}")
+    print(f"  Total force (body)  : [{total_force[0]:+.5g}, "
           f"{total_force[1]:+.5g}, {total_force[2]:+.5g}] N")
-    print(f"  Drag  (+X)          : {drag:+.5g} N")
-    print(f"  Lift  (+Z)          : {lift:+.5g} N")
-    print(f"  Side  (+Y)          : {span:+.5g} N")
-    print(f"  Per-cell drag range : [{drag_pc.min():.4g}, {drag_pc.max():.4g}] N")
-    print(f"  Per-cell lift range : [{lift_pc.min():.4g}, {lift_pc.max():.4g}] N")
+    print(f"  Drag (freestream)   : {drag:+.5g} N")
+    print(f"  Lift (perpendicular): {lift:+.5g} N")
+    print(f"  Side (spanwise)     : {span:+.5g} N")
 
-    return {
-        "total_force_N":    total_force,
-        "drag_N":           drag,
-        "lift_N":           lift,
-        "span_N":           span,
-        "n_ib_cells":       n_ib,
-        "force_field_name": f_name,
-        "v_inf_ms":         v_inf,
-        "n_upstream_pts":   n_upstream,
-    }
+    drag_pc = F_pts @ drag_dir
+    lift_pc = F_pts @ lift_dir
+    print(f"  Per-pt drag range   : [{drag_pc.min():.4g}, {drag_pc.max():.4g}] N")
+    print(f"  Per-pt lift range   : [{lift_pc.min():.4g}, {lift_pc.max():.4g}] N")
+
+    return dict(total_force_N=total_force,
+                drag_N=drag, lift_N=lift, span_N=span,
+                n_ib_pts=n_ib, force_field_name=f_name,
+                v_inf_ms=v_inf, n_upstream_pts=n_upstream,
+                alpha_deg=alpha_deg, drag_axis=drag_dir, lift_axis=lift_dir)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  5.  print_summary()
+#  5.  print_summary
 # ──────────────────────────────────────────────────────────────────────────────
 
 def print_summary(results: dict) -> None:
-    """Print a clean final aerodynamic force summary."""
+    """Print the final aerodynamic force summary table."""
 
     print(f"\n{'='*64}")
     print("  AERODYNAMIC FORCE SUMMARY")
     print(f"{'='*64}")
 
-    v_inf = results.get("v_inf_ms", 0.0)
+    alpha     = results.get("alpha_deg", 0.0)
+    v_inf     = results.get("v_inf_ms",  0.0)
+    total     = results.get("total_force_N", np.zeros(3))
+    drag      = results.get("drag_N",  0.0)
+    lift      = results.get("lift_N",  0.0)
+    span      = results.get("span_N",  0.0)
+    n_ib      = results.get("n_ib_pts", 0)
+    ff        = results.get("force_field_name", "N/A")
+    drag_axis = results.get("drag_axis", np.array([1., 0., 0.]))
+    lift_axis = results.get("lift_axis", np.array([0., 0., 1.]))
+
+    print(f"  Alpha (AoA)         : {alpha:+.4f} deg")
     if v_inf:
-        print(f"  Freestream velocity V∞ : {v_inf:.4g} m/s  (drag direction)")
+        print(f"  Freestream V∞       : {v_inf:.4f} m/s  (along drag axis)")
 
-    total = results.get("total_force_N", np.zeros(3))
-    drag  = results.get("drag_N",  0.0)
-    lift  = results.get("lift_N",  0.0)
-    span  = results.get("span_N",  0.0)
-    n_ib  = results.get("n_ib_cells", 0)
-    ff    = results.get("force_field_name", "N/A")
+    print(f"\n  Body-frame force    : [{total[0]:+.5g}, "
+          f"{total[1]:+.5g}, {total[2]:+.5g}] N")
 
-    print(f"\n  Total force vector  : [{total[0]:+.5g}, {total[1]:+.5g}, "
-          f"{total[2]:+.5g}] N")
+    print(f"\n  {'Component':<26s}  {'Force [N]':>12s}")
+    print(f"  {'─'*26}  {'─'*12}")
+    print(f"  {'Drag  (freestream)':<26s}  {drag:>+12.4f}")
+    print(f"  {'Lift  (perpendicular)':<26s}  {lift:>+12.4f}")
+    print(f"  {'Side  (spanwise)':<26s}  {span:>+12.4f}")
 
-    print(f"\n  {'Component':<28s}  {'Force [N]':>12s}")
-    print(f"  {'─'*28}  {'─'*12}")
-    print(f"  {'Drag  (+X, streamwise)':<28s}  {drag:>+12.4f}")
-    print(f"  {'Lift  (+Z, vertical)':<28s}  {lift:>+12.4f}")
-    print(f"  {'Side  (+Y, spanwise)':<28s}  {span:>+12.4f}")
+    print(f"\n  Source              : '{ff}'  ({n_ib:,} IB pts summed)")
 
-    print(f"\n  Source field    : '{ff}'")
-    print(f"  IB cells summed : {n_ib:,}")
+    print(f"\n  WIND AXES USED")
+    print(f"  Drag : [{drag_axis[0]:+.6f}, {drag_axis[1]:+.6f}, {drag_axis[2]:+.6f}]")
+    print(f"  Lift : [{lift_axis[0]:+.6f}, {lift_axis[1]:+.6f}, {lift_axis[2]:+.6f}]")
 
-    print(f"\n  COORDINATE SYSTEM & SIGN CONVENTION")
-    print(f"  +X : streamwise / freestream  →  positive drag opposes motion")
-    print(f"  +Z : vertical                 →  positive lift is upward")
-    print(f"  +Y : spanwise                 →  positive side force in +Y")
+    print(f"\n  SIGN CONVENTION")
+    print(f"  Positive drag  = force along freestream (opposes motion)")
+    print(f"  Positive lift  = force perpendicular to freestream, upward")
+    print(f"  Positive side  = force in +Y direction")
 
     print(f"\n  METHOD")
-    print(f"  Forces computed by summing 'Force time-averaged' over the IB")
-    print(f"  interface layer (CellRegion == 3).  This field is written by")
-    print(f"  nTop's IB solver kernel and includes both pressure (form) and")
-    print(f"  viscous (friction) contributions.")
-    print(f"  Assumed field units: N per IB grid cell.")
+    print(f"  Sums 'Force time-averaged' (IB solver, N/pt) over CellRegion==3.")
+    print(f"  Includes both pressure (form) and viscous (friction) contributions.")
+    print(f"  Forces stored in body-fixed frame; projected onto wind axes via alpha.")
     print(f"{'='*64}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-#  main()
+#  main
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
-    VTI_FILE = "CFD ATAS 0.006 at 10 deg ntop.vti"   # <- change to your file name
+    """Run the full analysis pipeline using VTI_FILE and ALPHA_DEG from config."""
 
-    if len(sys.argv) > 1:
-        VTI_FILE = sys.argv[1]
+    print(f"\n  VTI file  : {VTI_FILE}")
+    print(f"  Alpha     : {ALPHA_DEG:+.4f} deg")
 
-    # ── 1. Load VTI ───────────────────────────────────────────────────────
-    mesh = load_vti(VTI_FILE)
-
-    # ── 2. Extract all fields as NumPy arrays ─────────────────────────────
-    fields = extract_fields(mesh)
+    mesh    = load_vti(VTI_FILE)
+    fields  = extract_fields(mesh)
 
     if not fields:
-        print("\n  No data arrays found in the file.")
-        print("  Open the file in ParaView to verify its contents.")
+        print("\n  No data arrays found. Open in ParaView to verify file contents.")
         sys.exit(1)
 
-    # ── 3. Reconstruct body surface (validates normals, reports geometry) ──
     surface = compute_surface(mesh, fields)
-
-    # ── 4. Compute aerodynamic forces ─────────────────────────────────────
-    results = compute_forces(
-        mesh     = mesh,
-        fields   = fields,
-        drag_dir = DRAG_DIRECTION,
-        lift_dir = LIFT_DIRECTION,
-    )
-
-    # ── 5. Print final summary ────────────────────────────────────────────
+    results = compute_forces(mesh, fields, ALPHA_DEG)
     print_summary(results)
 
     return mesh, fields, surface, results
