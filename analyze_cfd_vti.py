@@ -56,6 +56,7 @@ Usage
     python analyze_cfd_vti.py
 """
 
+import csv
 import sys
 import numpy as np
 import pyvista as pv
@@ -68,7 +69,7 @@ if hasattr(sys.stdout, "reconfigure"):
 #  USER CONFIGURATION — edit these values before running
 # ──────────────────────────────────────────────────────────────────────────────
 
-VTI_FILE  = "CFD ATAS 0.011 at 2.5 deg Implicit.vti"  # path to the .vti file
+VTI_FILE  = "temp.vti"  # path to the .vti file
 ALPHA_DEG = 2.5                                         # angle of attack [deg]
                                                         # positive = freestream
                                                         # tilts from +X toward +Z
@@ -657,6 +658,48 @@ def print_summary(results: dict) -> None:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+#  6.  write_csv
+# ──────────────────────────────────────────────────────────────────────────────
+
+def write_csv(results: dict, vti_path: str) -> str:
+    """
+    Write a single-row CSV summary of the aerodynamic results.
+
+    The output file is placed next to the VTI file with the same stem:
+      e.g.  my_sim.vti  ->  my_sim_results.csv
+
+    Columns
+    -------
+    Lift : lift force [N]
+    Drag : drag force [N]
+    L/D  : lift-to-drag ratio
+    CL   : lift coefficient
+    CD   : drag coefficient
+
+    Returns
+    -------
+    str  absolute path of the written CSV file.
+    """
+    csv_path = Path(vti_path).with_stem(Path(vti_path).stem + "_results").with_suffix(".csv")
+
+    row = {
+        "Lift":  results.get("lift_N", float("nan")),
+        "Drag":  results.get("drag_N", float("nan")),
+        "L/D":   results.get("LD",     float("nan")),
+        "CL":    results.get("CL",     float("nan")),
+        "CD":    results.get("CD",     float("nan")),
+    }
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer.writeheader()
+        writer.writerow(row)
+
+    print(f"\n  CSV written : {csv_path.resolve()}")
+    return str(csv_path.resolve())
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 #  main
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -677,6 +720,7 @@ def main():
     results = compute_forces(mesh, fields, ALPHA_DEG,
                              v_inf_ref=V_INF, rho=RHO, s_ref=S_REF)
     print_summary(results)
+    write_csv(results, VTI_FILE)
 
     return mesh, fields, surface, results
 
